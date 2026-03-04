@@ -1,10 +1,13 @@
 /**
- * PianoRoll Component
- * Canvas-based пианоролл: создание нот кликом, растяжение, удаление.
+ * PianoRoll Component — modern grey UI
+ * Canvas grid: create notes by click, resize by dragging right edge, delete by click on body.
+ * Double-click on existing note → edit lyric/duration dialog.
  */
 
 import React, { useRef, useEffect, useCallback, useState } from 'react';
 import { Note } from '@/lib/synthesizer';
+import { HIRAGANA_ROWS, KANA_MAP } from '@/lib/voicebank';
+import Icon from '@/components/ui/icon';
 
 interface PianoRollProps {
   notes: Note[];
@@ -14,337 +17,281 @@ interface PianoRollProps {
   bpm: number;
 }
 
-// Все ноты от B4 до C3 (сверху вниз)
 const ALL_NOTES: string[] = [];
 const NOTE_NAMES = ['B', 'A#', 'A', 'G#', 'G', 'F#', 'F', 'E', 'D#', 'D', 'C#', 'C'];
-for (let oct = 4; oct >= 3; oct--) {
+for (let oct = 5; oct >= 2; oct--) {
   for (const n of NOTE_NAMES) {
-    if (oct === 3 && n !== 'C' && n !== 'C#' && n !== 'D' && n !== 'D#' &&
-        n !== 'E' && n !== 'F' && n !== 'F#' && n !== 'G' && n !== 'G#' &&
-        n !== 'A' && n !== 'A#' && n !== 'B') continue;
     ALL_NOTES.push(`${n}${oct}`);
   }
 }
 
-const ROW_HEIGHT = 20;
-const PIANO_WIDTH = 56;
-const COL_WIDTH = 80;     // ширина 1 бита
-const TOTAL_COLS = 32;
+const ROW_H = 18;
+const PIANO_W = 52;
+const COL_W = 64;
+const TOTAL_COLS = 48;
+const RESIZE_HANDLE_W = 8;
 
-const BLACK_NOTES = new Set(['C#', 'D#', 'F#', 'G#', 'A#']);
-
-function isBlackNote(noteName: string): boolean {
-  const match = noteName.match(/^([A-G]#?)/);
-  return match ? BLACK_NOTES.has(match[1]) : false;
-}
-
-// Подсвечиваем C ноты
-function isCNote(noteName: string): boolean {
-  return noteName.startsWith('C') && !noteName.startsWith('C#');
-}
+const BLACK = new Set(['C#', 'D#', 'F#', 'G#', 'A#']);
+const isBlack = (n: string) => BLACK.has(n.replace(/\d/, ''));
+const isC = (n: string) => /^C\d/.test(n) && !n.startsWith('C#');
 
 export const PianoRoll: React.FC<PianoRollProps> = ({
   notes, onNotesChange, playheadSec, isPlaying, bpm
 }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const containerRef = useRef<HTMLDivElement>(null);
 
-  const [pendingNote, setPendingNote] = useState<{
-    x: number; y: number; row: number; col: number;
+  // Dialog state
+  const [dialog, setDialog] = useState<{
+    mode: 'create' | 'edit';
+    noteId?: string;
+    row: number; col: number;
+    lyric: string;
+    duration: number; // in cols
   } | null>(null);
-  const [lyricInput, setLyricInput] = useState('');
-  const [lyricDialogOpen, setLyricDialogOpen] = useState(false);
 
   const draggingRef = useRef<{ noteId: string; startX: number; origDur: number } | null>(null);
-  const animFrameRef = useRef<number>(0);
+  const rafRef = useRef<number>(0);
 
   const secPerBeat = 60 / bpm;
-  const colDurSec = secPerBeat / 4; // 1 колонка = 1/4 бита
+  const colSec = secPerBeat / 4;
 
-  // Определяем размер canvas
-  const canvasWidth = PIANO_WIDTH + COL_WIDTH * TOTAL_COLS;
-  const canvasHeight = ROW_HEIGHT * ALL_NOTES.length;
+  const canvasW = PIANO_W + COL_W * TOTAL_COLS;
+  const canvasH = ROW_H * ALL_NOTES.length;
 
+  // ─── Draw ───────────────────────────────────────────────────
   const draw = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    // Фон
-    ctx.fillStyle = '#0D0D0D';
+    ctx.fillStyle = '#111318';
     ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-    // Сетка строк
+    // Rows
     ALL_NOTES.forEach((note, i) => {
-      const y = i * ROW_HEIGHT;
-      const isBlack = isBlackNote(note);
-      const isC = isCNote(note);
-
-      // Фон строки
-      ctx.fillStyle = isBlack ? '#131313' : '#161616';
-      ctx.fillRect(PIANO_WIDTH, y, canvas.width - PIANO_WIDTH, ROW_HEIGHT);
-
-      // C-ноты — слабая подсветка
-      if (isC) {
-        ctx.fillStyle = 'rgba(139, 26, 26, 0.06)';
-        ctx.fillRect(PIANO_WIDTH, y, canvas.width - PIANO_WIDTH, ROW_HEIGHT);
+      const y = i * ROW_H;
+      ctx.fillStyle = isBlack(note) ? '#13151e' : '#161920';
+      ctx.fillRect(PIANO_W, y, canvas.width - PIANO_W, ROW_H);
+      if (isC(note)) {
+        ctx.fillStyle = 'rgba(59,130,246,0.04)';
+        ctx.fillRect(PIANO_W, y, canvas.width - PIANO_W, ROW_H);
       }
-
-      // Горизонтальная линия
-      ctx.strokeStyle = isC ? 'rgba(139, 26, 26, 0.3)' : 'rgba(139, 115, 85, 0.12)';
-      ctx.lineWidth = isC ? 1 : 0.5;
-      ctx.beginPath();
-      ctx.moveTo(PIANO_WIDTH, y);
-      ctx.lineTo(canvas.width, y);
-      ctx.stroke();
+      ctx.strokeStyle = isC(note) ? 'rgba(59,130,246,0.18)' : 'rgba(255,255,255,0.04)';
+      ctx.lineWidth = 0.5;
+      ctx.beginPath(); ctx.moveTo(PIANO_W, y); ctx.lineTo(canvas.width, y); ctx.stroke();
     });
 
-    // Вертикальные линии сетки
+    // Vertical grid
     for (let col = 0; col <= TOTAL_COLS; col++) {
-      const x = PIANO_WIDTH + col * COL_WIDTH;
-      const isBeat = col % 4 === 0;
+      const x = PIANO_W + col * COL_W;
       const isMeasure = col % 16 === 0;
+      const isBeat = col % 4 === 0;
       ctx.strokeStyle = isMeasure
-        ? 'rgba(201, 168, 76, 0.3)'
+        ? 'rgba(255,255,255,0.14)'
         : isBeat
-        ? 'rgba(139, 26, 26, 0.2)'
-        : 'rgba(139, 115, 85, 0.08)';
+        ? 'rgba(255,255,255,0.06)'
+        : 'rgba(255,255,255,0.025)';
       ctx.lineWidth = isMeasure ? 1 : 0.5;
-      ctx.beginPath();
-      ctx.moveTo(x, 0);
-      ctx.lineTo(x, canvas.height);
-      ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, canvas.height); ctx.stroke();
     }
 
-    // Пианино (левая панель)
+    // Measure numbers
+    ctx.fillStyle = 'rgba(255,255,255,0.2)';
+    ctx.font = '10px system-ui';
+    ctx.textAlign = 'left';
+    for (let m = 0; m <= TOTAL_COLS / 16; m++) {
+      ctx.fillText(`${m + 1}`, PIANO_W + m * 16 * COL_W + 3, 10);
+    }
+
+    // Piano keys
     ALL_NOTES.forEach((note, i) => {
-      const y = i * ROW_HEIGHT;
-      const isBlack = isBlackNote(note);
-      const isC = isCNote(note);
+      const y = i * ROW_H;
+      ctx.fillStyle = isBlack(note) ? '#0f1017' : '#1e2130';
+      ctx.fillRect(0, y + 0.5, PIANO_W - 1, ROW_H - 1);
 
-      // Клавиша
-      ctx.fillStyle = isBlack ? '#111' : '#1A1A1A';
-      ctx.fillRect(0, y + 0.5, PIANO_WIDTH - 1, ROW_HEIGHT - 1);
-
-      // Акцент белых клавиш
-      if (!isBlack) {
-        ctx.fillStyle = 'rgba(255,255,255,0.03)';
-        ctx.fillRect(0, y + 0.5, PIANO_WIDTH - 1, ROW_HEIGHT - 1);
-      }
-
-      // Метка C нот
-      if (isC) {
-        ctx.fillStyle = '#C9A84C';
-        ctx.font = '9px "Shippori Mincho", serif';
+      if (isC(note)) {
+        ctx.fillStyle = '#3b82f6';
+        ctx.fillRect(PIANO_W - 3, y + 3, 2, ROW_H - 6);
+        ctx.fillStyle = '#9ba3b8';
+        ctx.font = '9px system-ui';
         ctx.textAlign = 'right';
-        ctx.fillText(note, PIANO_WIDTH - 4, y + ROW_HEIGHT - 5);
+        ctx.fillText(note, PIANO_W - 6, y + ROW_H - 4);
       }
 
-      // Разделитель клавиши
-      ctx.strokeStyle = 'rgba(139, 115, 85, 0.2)';
+      ctx.strokeStyle = 'rgba(255,255,255,0.05)';
       ctx.lineWidth = 0.5;
-      ctx.beginPath();
-      ctx.moveTo(0, y + ROW_HEIGHT);
-      ctx.lineTo(PIANO_WIDTH, y + ROW_HEIGHT);
-      ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(0, y + ROW_H); ctx.lineTo(PIANO_W, y + ROW_H); ctx.stroke();
     });
 
-    // Ноты
+    // Notes
     notes.forEach(note => {
-      const rowIdx = ALL_NOTES.indexOf(note.pitch);
-      if (rowIdx === -1) return;
+      const ri = ALL_NOTES.indexOf(note.pitch);
+      if (ri === -1) return;
+      const x = PIANO_W + note.col * COL_W;
+      const y = ri * ROW_H;
+      const w = Math.max(COL_W * 0.5, (note.duration / colSec) * COL_W);
+      const h = ROW_H - 2;
 
-      const x = PIANO_WIDTH + note.col * COL_WIDTH;
-      const y = rowIdx * ROW_HEIGHT;
-      const w = Math.max(COL_WIDTH * 0.5, (note.duration / colDurSec) * COL_WIDTH);
-      const h = ROW_HEIGHT - 1;
+      // Shadow
+      ctx.shadowColor = 'rgba(59,130,246,0.4)';
+      ctx.shadowBlur = 8;
 
-      // Тень ноты
-      ctx.shadowColor = 'rgba(192, 57, 43, 0.5)';
-      ctx.shadowBlur = 6;
-
-      // Заливка
+      // Fill
       const grad = ctx.createLinearGradient(x, y, x, y + h);
-      grad.addColorStop(0, 'rgba(192, 57, 43, 0.9)');
-      grad.addColorStop(1, 'rgba(139, 26, 26, 0.8)');
+      grad.addColorStop(0, '#4f96ff');
+      grad.addColorStop(1, '#2563eb');
       ctx.fillStyle = grad;
-      ctx.fillRect(x + 1, y + 0.5, w - 2, h);
+      ctx.beginPath();
+      ctx.roundRect(x + 1, y + 1, w - 2, h, 3);
+      ctx.fill();
 
       ctx.shadowBlur = 0;
 
-      // Граница
-      ctx.strokeStyle = '#C0392B';
+      // Border
+      ctx.strokeStyle = 'rgba(147,197,253,0.6)';
       ctx.lineWidth = 1;
-      ctx.strokeRect(x + 1, y + 0.5, w - 2, h);
+      ctx.beginPath();
+      ctx.roundRect(x + 1, y + 1, w - 2, h, 3);
+      ctx.stroke();
 
-      // Ручка растяжения справа
-      ctx.fillStyle = '#C9A84C';
-      ctx.fillRect(x + w - 5, y + 1, 3, h - 2);
+      // Resize handle
+      ctx.fillStyle = 'rgba(255,255,255,0.5)';
+      ctx.fillRect(x + w - RESIZE_HANDLE_W, y + 3, 2, h - 6);
 
-      // Текст ноты (хирагана)
-      ctx.fillStyle = '#F5EDD6';
-      ctx.font = `${Math.min(14, ROW_HEIGHT - 4)}px "Noto Serif JP", serif`;
+      // Lyric text
+      ctx.fillStyle = '#fff';
+      ctx.font = `${Math.min(13, ROW_H - 4)}px 'Noto Sans JP', sans-serif`;
       ctx.textAlign = 'left';
       ctx.textBaseline = 'middle';
-      const clipW = w - 10;
-      if (clipW > 10) {
+      if (w > 16) {
         ctx.save();
         ctx.beginPath();
-        ctx.rect(x + 3, y, clipW, ROW_HEIGHT);
+        ctx.rect(x + 4, y, w - RESIZE_HANDLE_W - 6, ROW_H);
         ctx.clip();
-        ctx.fillText(note.lyric, x + 4, y + ROW_HEIGHT / 2);
+        ctx.fillText(note.lyric, x + 5, y + ROW_H / 2);
         ctx.restore();
       }
     });
 
     // Playhead
     if (isPlaying || playheadSec > 0) {
-      const playX = PIANO_WIDTH + (playheadSec / colDurSec) * COL_WIDTH;
-      ctx.strokeStyle = '#C9A84C';
+      const px = PIANO_W + (playheadSec / colSec) * COL_W;
+      ctx.strokeStyle = '#f59e0b';
       ctx.lineWidth = 1.5;
-      ctx.setLineDash([4, 3]);
-      ctx.beginPath();
-      ctx.moveTo(playX, 0);
-      ctx.lineTo(playX, canvas.height);
-      ctx.stroke();
-      ctx.setLineDash([]);
+      ctx.beginPath(); ctx.moveTo(px, 0); ctx.lineTo(px, canvas.height); ctx.stroke();
 
-      // Треугольник-указатель
-      ctx.fillStyle = '#C9A84C';
+      ctx.fillStyle = '#f59e0b';
       ctx.beginPath();
-      ctx.moveTo(playX - 5, 0);
-      ctx.lineTo(playX + 5, 0);
-      ctx.lineTo(playX, 8);
+      ctx.moveTo(px - 5, 0); ctx.lineTo(px + 5, 0); ctx.lineTo(px, 7);
       ctx.fill();
     }
-  }, [notes, playheadSec, isPlaying, colDurSec]);
+  }, [notes, playheadSec, isPlaying, colSec]);
 
   useEffect(() => {
-    const animate = () => {
-      draw();
-      animFrameRef.current = requestAnimationFrame(animate);
-    };
-    animFrameRef.current = requestAnimationFrame(animate);
-    return () => cancelAnimationFrame(animFrameRef.current);
+    const loop = () => { draw(); rafRef.current = requestAnimationFrame(loop); };
+    rafRef.current = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(rafRef.current);
   }, [draw]);
 
-  // Обработка клика
-  const getCell = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
-    const canvas = canvasRef.current;
-    if (!canvas) return null;
-    const rect = canvas.getBoundingClientRect();
-    const scaleX = canvas.width / rect.width;
-    const scaleY = canvas.height / rect.height;
-    const x = (e.clientX - rect.left) * scaleX;
-    const y = (e.clientY - rect.top) * scaleY;
-    if (x < PIANO_WIDTH) return null;
-    const col = Math.floor((x - PIANO_WIDTH) / COL_WIDTH);
-    const row = Math.floor(y / ROW_HEIGHT);
-    return { x, y, col, row };
+  // ─── Mouse helpers ───────────────────────────────────────────
+  const getPos = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
+    const c = canvasRef.current!;
+    const r = c.getBoundingClientRect();
+    const sx = c.width / r.width;
+    const sy = c.height / r.height;
+    const x = (e.clientX - r.left) * sx;
+    const y = (e.clientY - r.top) * sy;
+    return { x, y, col: Math.floor((x - PIANO_W) / COL_W), row: Math.floor(y / ROW_H) };
   }, []);
 
   const handleMouseDown = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
-    const cell = getCell(e);
-    if (!cell) return;
+    const { x, col, row } = getPos(e);
+    if (x < PIANO_W) return;
 
-    const canvas = canvasRef.current!;
-    const rect = canvas.getBoundingClientRect();
-    const scaleX = canvas.width / rect.width;
-    const clickX = (e.clientX - rect.left) * scaleX;
-
-    // Проверяем, кликнули ли на ручку растяжения существующей ноты
+    // Check resize handle
     for (const note of notes) {
-      const rowIdx = ALL_NOTES.indexOf(note.pitch);
-      if (rowIdx === -1) continue;
-      const noteX = PIANO_WIDTH + note.col * COL_WIDTH;
-      const noteW = Math.max(COL_WIDTH * 0.5, (note.duration / colDurSec) * COL_WIDTH);
-      const noteY = rowIdx * ROW_HEIGHT;
-      const noteRowIdx = rowIdx;
-
-      if (
-        clickX >= noteX + noteW - 12 &&
-        clickX <= noteX + noteW + 2 &&
-        cell.row === noteRowIdx
-      ) {
+      const ri = ALL_NOTES.indexOf(note.pitch);
+      if (ri !== row) continue;
+      const nx = PIANO_W + note.col * COL_W;
+      const nw = Math.max(COL_W * 0.5, (note.duration / colSec) * COL_W);
+      if (x >= nx + nw - RESIZE_HANDLE_W - 2 && x <= nx + nw + 2) {
         draggingRef.current = { noteId: note.id, startX: e.clientX, origDur: note.duration };
         return;
       }
+    }
 
-      // Клик по существующей ноте — удаление
-      if (
-        clickX >= noteX + 1 &&
-        clickX <= noteX + noteW - 12 &&
-        cell.row === rowIdx
-      ) {
-        onNotesChange(notes.filter(n => n.id !== note.id));
+    // Check note body — single click = delete
+    for (const note of notes) {
+      const ri = ALL_NOTES.indexOf(note.pitch);
+      if (ri !== row) continue;
+      const nx = PIANO_W + note.col * COL_W;
+      const nw = Math.max(COL_W * 0.5, (note.duration / colSec) * COL_W);
+      if (x >= nx && x < nx + nw - RESIZE_HANDLE_W - 2) {
+        if (e.detail === 2) {
+          // double-click → edit
+          setDialog({ mode: 'edit', noteId: note.id, row: ri, col: note.col, lyric: note.lyric, duration: Math.round(note.duration / colSec) });
+        } else {
+          onNotesChange(notes.filter(n => n.id !== note.id));
+        }
         return;
       }
     }
 
-    // Пустая ячейка — создаём ноту
-    if (cell.row >= 0 && cell.row < ALL_NOTES.length && cell.col >= 0 && cell.col < TOTAL_COLS) {
-      setPendingNote({ x: cell.x, y: cell.y, row: cell.row, col: cell.col });
-      setLyricInput('');
-      setLyricDialogOpen(true);
+    // Empty cell → create
+    if (row >= 0 && row < ALL_NOTES.length && col >= 0 && col < TOTAL_COLS) {
+      setDialog({ mode: 'create', row, col, lyric: '', duration: 2 });
     }
-  }, [notes, onNotesChange, colDurSec, getCell]);
+  }, [notes, onNotesChange, colSec, getPos]);
 
   const handleMouseMove = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
-    if (!draggingRef.current) return;
     const drag = draggingRef.current;
+    if (!drag) return;
     const canvas = canvasRef.current!;
     const rect = canvas.getBoundingClientRect();
-    const scaleX = canvas.width / rect.width;
-    const deltaX = (e.clientX - drag.startX) * scaleX;
-    const deltaDur = (deltaX / COL_WIDTH) * colDurSec;
-    const newDur = Math.max(colDurSec * 0.5, drag.origDur + deltaDur);
+    const dx = (e.clientX - drag.startX) * (canvas.width / rect.width);
+    const newDur = Math.max(colSec * 0.5, drag.origDur + (dx / COL_W) * colSec);
+    onNotesChange(notes.map(n => n.id === drag.noteId ? { ...n, duration: newDur } : n));
+  }, [notes, onNotesChange, colSec]);
 
-    onNotesChange(notes.map(n =>
-      n.id === drag.noteId ? { ...n, duration: newDur } : n
-    ));
-  }, [notes, onNotesChange, colDurSec]);
+  const handleMouseUp = useCallback(() => { draggingRef.current = null; }, []);
 
-  const handleMouseUp = useCallback(() => {
-    draggingRef.current = null;
-  }, []);
+  // ─── Dialog confirm ──────────────────────────────────────────
+  const confirmDialog = () => {
+    if (!dialog) return;
+    const lyric = dialog.lyric.trim();
+    if (!lyric) { setDialog(null); return; }
 
-  const confirmLyric = () => {
-    if (!pendingNote || !lyricInput.trim()) {
-      setLyricDialogOpen(false);
-      setPendingNote(null);
-      return;
+    const pitch = ALL_NOTES[dialog.row];
+    const duration = Math.max(0.5, dialog.duration) * colSec;
+    const startTime = dialog.col * colSec;
+
+    if (dialog.mode === 'create') {
+      const newNote: Note = {
+        id: `n_${Date.now()}_${Math.random().toString(36).slice(2)}`,
+        pitch, duration, lyric, startTime,
+        col: dialog.col, row: dialog.row,
+      };
+      onNotesChange([...notes, newNote]);
+    } else {
+      onNotesChange(notes.map(n => n.id === dialog.noteId
+        ? { ...n, lyric, duration }
+        : n
+      ));
     }
-
-    const pitch = ALL_NOTES[pendingNote.row];
-    const newNote: Note = {
-      id: `note_${Date.now()}_${Math.random()}`,
-      pitch,
-      duration: colDurSec * 2,
-      lyric: lyricInput.trim(),
-      startTime: pendingNote.col * colDurSec,
-      col: pendingNote.col,
-      row: pendingNote.row,
-    };
-    onNotesChange([...notes, newNote]);
-    setLyricDialogOpen(false);
-    setPendingNote(null);
-    setLyricInput('');
+    setDialog(null);
   };
 
+  const allKana = HIRAGANA_ROWS.flatMap(r => r.kana);
+
   return (
-    <div className="relative flex flex-col h-full" ref={containerRef}>
-      {/* Canvas */}
-      <div className="overflow-auto flex-1" style={{ background: '#0D0D0D' }}>
+    <div className="relative flex flex-col h-full" style={{ background: '#111318' }}>
+      <div className="flex-1 overflow-auto">
         <canvas
           ref={canvasRef}
-          width={canvasWidth}
-          height={canvasHeight}
-          style={{
-            display: 'block',
-            cursor: 'crosshair',
-            imageRendering: 'pixelated',
-          }}
+          width={canvasW}
+          height={canvasH}
+          style={{ display: 'block', cursor: 'crosshair' }}
           onMouseDown={handleMouseDown}
           onMouseMove={handleMouseMove}
           onMouseUp={handleMouseUp}
@@ -352,72 +299,99 @@ export const PianoRoll: React.FC<PianoRollProps> = ({
         />
       </div>
 
-      {/* Диалог ввода лирики */}
-      {lyricDialogOpen && (
-        <div
-          className="fixed inset-0 flex items-center justify-center z-50"
-          style={{ background: 'rgba(0,0,0,0.7)' }}
-          onClick={() => setLyricDialogOpen(false)}
-        >
-          <div
-            className="note-dialog animate-fade-in"
-            style={{ minWidth: 280 }}
-            onClick={e => e.stopPropagation()}
-          >
-            <div className="panel-header mb-3" style={{ color: '#C9A84C' }}>
-              音節入力 — Введите слог
-            </div>
-            <div className="text-xs mb-2" style={{ color: '#8B7355' }}>
-              {pendingNote && ALL_NOTES[pendingNote.row]} • Хирагана (あ, い, う, か...)
-            </div>
-            <input
-              autoFocus
-              className="note-input mb-3"
-              value={lyricInput}
-              onChange={e => setLyricInput(e.target.value)}
-              onKeyDown={e => {
-                if (e.key === 'Enter') confirmLyric();
-                if (e.key === 'Escape') setLyricDialogOpen(false);
-              }}
-              placeholder="あ"
-              maxLength={3}
-            />
-            {/* Быстрые кнопки хираганы */}
-            <div className="flex flex-wrap gap-1 mb-3">
-              {['あ','い','う','え','お','か','き','く','け','こ','さ','な','は','ま','ら'].map(k => (
-                <button
-                  key={k}
-                  onClick={() => setLyricInput(k)}
-                  style={{
-                    background: lyricInput === k ? 'var(--crimson)' : '#1a1a1a',
-                    border: '1px solid var(--gold-dim)',
-                    color: lyricInput === k ? '#F5EDD6' : '#C9A84C',
-                    padding: '4px 8px',
-                    fontSize: 16,
-                    cursor: 'pointer',
-                    fontFamily: 'Noto Serif JP, serif',
-                    transition: 'all 0.15s',
-                  }}
-                >
-                  {k}
-                </button>
-              ))}
-            </div>
-            <div className="flex gap-2">
-              <button
-                onClick={confirmLyric}
-                className="transport-btn active flex-1"
-              >
-                確認 OK
-              </button>
-              <button
-                onClick={() => setLyricDialogOpen(false)}
-                className="transport-btn"
-                style={{ flex: 1 }}
-              >
-                取消 Отмена
+      {/* Note dialog */}
+      {dialog && (
+        <div className="note-dialog-overlay" onClick={() => setDialog(null)}>
+          <div className="note-dialog" onClick={e => e.stopPropagation()}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+              <div>
+                <div style={{ fontSize: 14, fontWeight: 600, color: 'var(--text-1)' }}>
+                  {dialog.mode === 'create' ? 'Add Note' : 'Edit Note'}
+                </div>
+                <div style={{ fontSize: 12, color: 'var(--text-3)', marginTop: 2 }}>
+                  {ALL_NOTES[dialog.row]} · col {dialog.col + 1}
+                </div>
+              </div>
+              <button onClick={() => setDialog(null)} className="btn btn-ghost btn-icon btn-sm">
+                <Icon name="X" size={14} />
               </button>
             </div>
+
+            {/* Lyric input */}
+            <div style={{ marginBottom: 12 }}>
+              <div className="section-label">Lyric (hiragana)</div>
+              <input
+                autoFocus
+                className="kana-input"
+                value={dialog.lyric}
+                onChange={e => setDialog(d => d ? { ...d, lyric: e.target.value } : d)}
+                onKeyDown={e => { if (e.key === 'Enter') confirmDialog(); if (e.key === 'Escape') setDialog(null); }}
+                placeholder="あ"
+                maxLength={4}
+              />
+            </div>
+
+            {/* Duration */}
+            <div style={{ marginBottom: 14 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 6 }}>
+                <div className="section-label" style={{ marginBottom: 0 }}>Duration</div>
+                <span style={{ fontSize: 12, color: 'var(--accent-blue)', fontWeight: 600 }}>
+                  {dialog.duration} {dialog.duration === 1 ? 'beat div' : 'beat divs'}
+                  &nbsp;({(dialog.duration * colSec).toFixed(2)}s)
+                </span>
+              </div>
+              <input
+                type="range" min={1} max={32} value={dialog.duration}
+                onChange={e => setDialog(d => d ? { ...d, duration: Number(e.target.value) } : d)}
+                className="synth-slider"
+                style={{ '--pct': `${((dialog.duration - 1) / 31) * 100}%` } as React.CSSProperties}
+              />
+              <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 4 }}>
+                {[1, 2, 4, 8, 16].map(v => (
+                  <button key={v} onClick={() => setDialog(d => d ? { ...d, duration: v } : d)}
+                    className={`btn btn-ghost btn-sm ${dialog.duration === v ? 'active-play' : ''}`}
+                    style={{ padding: '3px 8px', fontSize: 11 }}>
+                    {v}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Quick kana */}
+            <div style={{ marginBottom: 14 }}>
+              <div className="section-label">Quick select</div>
+              <div style={{ maxHeight: 180, overflowY: 'auto', paddingRight: 4 }}>
+                {HIRAGANA_ROWS.map(row => (
+                  <div key={row.label} style={{ marginBottom: 6 }}>
+                    <div style={{ fontSize: 10, color: 'var(--text-3)', marginBottom: 3 }}>{row.label}</div>
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 3 }}>
+                      {row.kana.map(k => (
+                        <button key={k} onClick={() => setDialog(d => d ? { ...d, lyric: k } : d)}
+                          className={`kana-btn ${dialog.lyric === k ? 'selected' : ''}`}>
+                          {k}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <div style={{ display: 'flex', gap: 8 }}>
+              <button onClick={confirmDialog} className="btn btn-primary" style={{ flex: 1 }}
+                disabled={!dialog.lyric.trim() || !KANA_MAP[dialog.lyric.trim()]}>
+                <Icon name="Check" size={13} />
+                {dialog.mode === 'create' ? 'Add Note' : 'Save Changes'}
+              </button>
+              <button onClick={() => setDialog(null)} className="btn btn-ghost">
+                Cancel
+              </button>
+            </div>
+            {dialog.lyric.trim() && !KANA_MAP[dialog.lyric.trim()] && (
+              <div style={{ marginTop: 8, fontSize: 11, color: 'var(--accent-red)' }}>
+                Unknown syllable — use the quick select above
+              </div>
+            )}
           </div>
         </div>
       )}

@@ -1,155 +1,103 @@
 /**
  * UTAU Synthesizer Engine
- * Конкатенативный синтез: генерирует AudioBuffer для последовательности нот,
- * используя OTO.ini параметры и кроссфейд между нотами.
+ * Конкатенативный синтез с crossfade через OTO.ini overlap.
  */
 
-import { generateSample, OTO_INI, noteToFrequency } from './voicebank';
+import { generateSample, OTO_INI, noteToFrequency, VoiceGender } from './voicebank';
 
 export interface Note {
   id: string;
-  pitch: string;        // "C4", "D#3" и т.п.
-  duration: number;     // длительность в секундах
-  lyric: string;        // хирагана
-  startTime: number;    // позиция на тайминлайне (секунды)
-  col: number;          // колонка в сетке
-  row: number;          // строка в сетке (индекс ноты)
+  pitch: string;      // "C4", "D#3" и т.п.
+  duration: number;   // секунды
+  lyric: string;      // хирагана
+  startTime: number;  // позиция на таймлайне (сек)
+  col: number;
+  row: number;
 }
 
-/**
- * Синтезирует полный аудио для списка нот.
- * Использует crossfade через overlap из OTO.ini.
- */
 export async function synthesizeNotes(
   ctx: AudioContext,
-  notes: Note[]
+  notes: Note[],
+  gender: VoiceGender = 'male'
 ): Promise<AudioBuffer> {
   if (notes.length === 0) {
     return ctx.createBuffer(1, ctx.sampleRate, ctx.sampleRate);
   }
 
-  // Сортируем по времени
   const sorted = [...notes].sort((a, b) => a.startTime - b.startTime);
+  const totalDur = sorted.reduce((m, n) => Math.max(m, n.startTime + n.duration), 0) + 0.5;
+  const totalSamples = Math.floor(ctx.sampleRate * totalDur);
+  const out = ctx.createBuffer(1, totalSamples, ctx.sampleRate);
+  const outData = out.getChannelData(0);
 
-  // Считаем общую длительность
-  const totalDuration = sorted.reduce((max, n) => Math.max(max, n.startTime + n.duration), 0) + 0.5;
-  const totalSamples = Math.floor(ctx.sampleRate * totalDuration);
-  const outputBuffer = ctx.createBuffer(1, totalSamples, ctx.sampleRate);
-  const outputData = outputBuffer.getChannelData(0);
-
-  for (let i = 0; i < sorted.length; i++) {
-    const note = sorted[i];
-    const oto = OTO_INI[note.lyric] ?? {
-      offset: 10, consonant: 0, preutterance: 10, overlap: 20, cutoff: 30
-    };
-
+  for (const note of sorted) {
+    const oto = OTO_INI[note.lyric] ?? { offset: 10, consonant: 0, preutterance: 10, overlap: 20, cutoff: 30 };
     const freq = noteToFrequency(note.pitch);
+    const sampleDur = note.duration + oto.cutoff / 1000;
+    const buf = generateSample(ctx, note.lyric, freq, sampleDur, gender);
+    const bufData = buf.getChannelData(0);
 
-    // Генерируем сэмпл чуть длиннее ноты для хвоста
-    const sampleDuration = note.duration + oto.cutoff / 1000;
-    const sampleBuffer = generateSample(ctx, note.lyric, freq, sampleDuration);
-    const sampleData = sampleBuffer.getChannelData(0);
-
-    // Позиция начала в выходном буфере
-    // pre-utterance: нота начинается немного раньше своей позиции
     const startSec = note.startTime - oto.preutterance / 1000;
     const startSample = Math.max(0, Math.floor(startSec * ctx.sampleRate));
+    const xfadeSamples = Math.floor((oto.overlap / 1000) * ctx.sampleRate);
 
-    // Crossfade: overlap — количество мс пересечения с предыдущей нотой
-    const crossfadeSamples = Math.floor((oto.overlap / 1000) * ctx.sampleRate);
-
-    for (let s = 0; s < sampleBuffer.length; s++) {
-      const outIdx = startSample + s;
-      if (outIdx >= totalSamples) break;
+    for (let s = 0; s < buf.length; s++) {
+      const idx = startSample + s;
+      if (idx >= totalSamples) break;
 
       let gain = 1.0;
-
-      // Fade-in crossfade в начале
-      if (s < crossfadeSamples && crossfadeSamples > 0) {
-        gain = s / crossfadeSamples;
+      if (s < xfadeSamples && xfadeSamples > 0) gain = s / xfadeSamples;
+      const fadeStart = Math.floor(note.duration * ctx.sampleRate) - xfadeSamples;
+      if (s > fadeStart && fadeStart > 0) {
+        gain *= Math.max(0, 1 - (s - fadeStart) / (buf.length - fadeStart));
       }
 
-      // Fade-out в конце ноты
-      const fadeOutStart = Math.floor(note.duration * ctx.sampleRate) - crossfadeSamples;
-      if (s > fadeOutStart && fadeOutStart > 0) {
-        const fadeProgress = (s - fadeOutStart) / (sampleBuffer.length - fadeOutStart);
-        gain *= Math.max(0, 1 - fadeProgress);
-      }
-
-      outputData[outIdx] += sampleData[s] * gain;
+      outData[idx] += bufData[s] * gain;
     }
   }
 
-  // Нормализуем
   let peak = 0;
-  for (let i = 0; i < outputData.length; i++) {
-    peak = Math.max(peak, Math.abs(outputData[i]));
-  }
+  for (let i = 0; i < outData.length; i++) peak = Math.max(peak, Math.abs(outData[i]));
   if (peak > 0.01) {
-    const scale = 0.9 / peak;
-    for (let i = 0; i < outputData.length; i++) {
-      outputData[i] *= scale;
-    }
+    const scale = 0.88 / peak;
+    for (let i = 0; i < outData.length; i++) outData[i] *= scale;
   }
 
-  return outputBuffer;
+  return out;
 }
 
-/**
- * Экспортирует AudioBuffer в WAV (PCM 16-bit).
- */
 export function audioBufferToWav(buffer: AudioBuffer): ArrayBuffer {
-  const numChannels = buffer.numberOfChannels;
-  const sampleRate = buffer.sampleRate;
-  const length = buffer.length;
-  const bytesPerSample = 2;
-  const blockAlign = numChannels * bytesPerSample;
-  const dataSize = length * blockAlign;
-  const wavBuffer = new ArrayBuffer(44 + dataSize);
-  const view = new DataView(wavBuffer);
+  const numCh = buffer.numberOfChannels;
+  const sr = buffer.sampleRate;
+  const len = buffer.length;
+  const bps = 2;
+  const ba = numCh * bps;
+  const dataSize = len * ba;
+  const ab = new ArrayBuffer(44 + dataSize);
+  const v = new DataView(ab);
 
-  // WAV header
-  writeString(view, 0, 'RIFF');
-  view.setUint32(4, 36 + dataSize, true);
-  writeString(view, 8, 'WAVE');
-  writeString(view, 12, 'fmt ');
-  view.setUint32(16, 16, true);
-  view.setUint16(20, 1, true); // PCM
-  view.setUint16(22, numChannels, true);
-  view.setUint32(24, sampleRate, true);
-  view.setUint32(28, sampleRate * blockAlign, true);
-  view.setUint16(32, blockAlign, true);
-  view.setUint16(34, 16, true);
-  writeString(view, 36, 'data');
-  view.setUint32(40, dataSize, true);
+  const ws = (o: number, s: string) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  ws(0, 'RIFF'); v.setUint32(4, 36 + dataSize, true);
+  ws(8, 'WAVE'); ws(12, 'fmt ');
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true);
+  v.setUint16(22, numCh, true); v.setUint32(24, sr, true);
+  v.setUint32(28, sr * ba, true); v.setUint16(32, ba, true);
+  v.setUint16(34, 16, true); ws(36, 'data'); v.setUint32(40, dataSize, true);
 
-  // PCM data
   let offset = 44;
-  for (let i = 0; i < length; i++) {
-    for (let ch = 0; ch < numChannels; ch++) {
-      const sample = Math.max(-1, Math.min(1, buffer.getChannelData(ch)[i]));
-      view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7FFF, true);
+  for (let i = 0; i < len; i++) {
+    for (let ch = 0; ch < numCh; ch++) {
+      const s = Math.max(-1, Math.min(1, buffer.getChannelData(ch)[i]));
+      v.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
       offset += 2;
     }
   }
-
-  return wavBuffer;
+  return ab;
 }
 
-function writeString(view: DataView, offset: number, str: string) {
-  for (let i = 0; i < str.length; i++) {
-    view.setUint8(offset + i, str.charCodeAt(i));
-  }
-}
-
-/**
- * Скачивает blob как файл.
- */
 export function downloadBlob(blob: Blob, filename: string) {
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
-  a.href = url;
-  a.download = filename;
-  a.click();
+  a.href = url; a.download = filename; a.click();
   URL.revokeObjectURL(url);
 }

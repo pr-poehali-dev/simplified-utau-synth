@@ -1,454 +1,409 @@
 /**
- * UTAU Synthesizer — Main Application
- * Японская эстетика + пианоролл + Web Audio синтез + экспорт
+ * UTAU Synthesizer — Main App
+ * Modern grey UI, English interface
  */
 
-import React, { useState, useRef, useCallback, useEffect } from 'react';
+import React, { useState, useRef, useCallback } from 'react';
 import { PianoRoll } from '@/components/PianoRoll';
 import { Note, synthesizeNotes, audioBufferToWav, downloadBlob } from '@/lib/synthesizer';
-import { OTO_INI } from '@/lib/voicebank';
+import { OTO_INI, HIRAGANA_ROWS, VoiceGender } from '@/lib/voicebank';
 import Icon from '@/components/ui/icon';
 
-type Tab = 'piano' | 'voice' | 'export' | 'params';
-
-const HIRAGANA_GRID = [
-  ['あ','い','う','え','お'],
-  ['か','き','く','け','こ'],
-  ['さ','し','す','せ','そ'],
-  ['た','ち','つ','て','と'],
-  ['な','に','ぬ','ね','の'],
-  ['は','ひ','ふ','へ','ほ'],
-  ['ま','み','む','め','も'],
-  ['ら','り','る','れ','ろ'],
-];
+type Tab = 'piano' | 'voice' | 'params' | 'export';
 
 const Index: React.FC = () => {
   const [notes, setNotes] = useState<Note[]>([]);
-  const [activeTab, setActiveTab] = useState<Tab>('piano');
+  const [tab, setTab] = useState<Tab>('piano');
   const [bpm, setBpm] = useState(90);
+  const [gender, setGender] = useState<VoiceGender>('male');
   const [isPlaying, setIsPlaying] = useState(false);
   const [playheadSec, setPlayheadSec] = useState(0);
-  const [statusMsg, setStatusMsg] = useState('準備完了 — Готов к работе');
-  const [synthParams, setSynthParams] = useState({
-    selectedKana: 'あ',
-    offset: 10,
-    consonant: 80,
-    preutterance: 60,
-    overlap: 40,
-  });
+  const [status, setStatus] = useState('Ready');
   const [isExporting, setIsExporting] = useState(false);
 
-  const audioCtxRef = useRef<AudioContext | null>(null);
-  const playbackSourceRef = useRef<AudioBufferSourceNode | null>(null);
-  const playStartTimeRef = useRef<number>(0);
-  const playStartSecRef = useRef<number>(0);
-  const rafRef = useRef<number>(0);
+  const [otoKana, setOtoKana] = useState('あ');
+  const [otoVals, setOtoVals] = useState({ offset: 10, consonant: 80, preutterance: 60, overlap: 40 });
 
-  const getAudioCtx = () => {
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const sourceRef = useRef<AudioBufferSourceNode | null>(null);
+  const rafRef = useRef<number>(0);
+  const playStartRef = useRef<number>(0);
+
+  const getCtx = () => {
     if (!audioCtxRef.current || audioCtxRef.current.state === 'closed') {
       audioCtxRef.current = new AudioContext();
     }
     return audioCtxRef.current;
   };
 
-  const stopPlayback = useCallback(() => {
-    if (playbackSourceRef.current) {
-      try { playbackSourceRef.current.stop(); } catch (_e) { void _e; }
-      playbackSourceRef.current = null;
+  const stop = useCallback(() => {
+    if (sourceRef.current) {
+      try { sourceRef.current.stop(); } catch (_e) { void _e; }
+      sourceRef.current = null;
     }
     cancelAnimationFrame(rafRef.current);
     setIsPlaying(false);
     setPlayheadSec(0);
-    playStartSecRef.current = 0;
   }, []);
 
-  const handlePlay = useCallback(async () => {
-    if (isPlaying) {
-      stopPlayback();
-      return;
-    }
+  const play = useCallback(async () => {
+    if (isPlaying) { stop(); return; }
+    if (notes.length === 0) { setStatus('Add notes to the piano roll first'); return; }
 
-    if (notes.length === 0) {
-      setStatusMsg('⚠ Добавьте ноты на пианоролл');
-      return;
-    }
-
-    setStatusMsg('合成中... Синтез...');
+    setStatus('Synthesizing…');
     try {
-      const ctx = getAudioCtx();
+      const ctx = getCtx();
       if (ctx.state === 'suspended') await ctx.resume();
 
-      const buffer = await synthesizeNotes(ctx, notes);
+      const buf = await synthesizeNotes(ctx, notes, gender);
+      const src = ctx.createBufferSource();
+      src.buffer = buf;
+      src.connect(ctx.destination);
+      src.start();
+      src.onended = () => { setIsPlaying(false); setPlayheadSec(0); cancelAnimationFrame(rafRef.current); setStatus('Playback complete'); };
 
-      const source = ctx.createBufferSource();
-      source.buffer = buffer;
-      source.connect(ctx.destination);
-      source.start();
-      source.onended = () => {
-        setIsPlaying(false);
-        setPlayheadSec(0);
-        cancelAnimationFrame(rafRef.current);
-        setStatusMsg('完了 — Воспроизведение завершено');
-      };
-
-      playbackSourceRef.current = source;
-      playStartTimeRef.current = ctx.currentTime;
-      playStartSecRef.current = 0;
+      sourceRef.current = src;
+      playStartRef.current = ctx.currentTime;
       setIsPlaying(true);
-      setStatusMsg('再生中 — Воспроизведение...');
+      setStatus('Playing…');
 
-      const animate = () => {
+      const tick = () => {
         const ctx2 = audioCtxRef.current;
         if (!ctx2) return;
-        const elapsed = ctx2.currentTime - playStartTimeRef.current;
-        setPlayheadSec(elapsed);
-        rafRef.current = requestAnimationFrame(animate);
+        setPlayheadSec(ctx2.currentTime - playStartRef.current);
+        rafRef.current = requestAnimationFrame(tick);
       };
-      rafRef.current = requestAnimationFrame(animate);
-    } catch (err) {
-      console.error(err);
-      setStatusMsg('エラー — Ошибка синтеза');
+      rafRef.current = requestAnimationFrame(tick);
+    } catch (e) {
+      console.error(e);
+      setStatus('Synthesis error — check console');
     }
-  }, [isPlaying, notes, stopPlayback]);
+  }, [isPlaying, notes, gender, stop]);
 
-  const handleExportWav = useCallback(async () => {
-    if (notes.length === 0) {
-      setStatusMsg('⚠ Нет нот для экспорта');
-      return;
-    }
+  const exportWav = useCallback(async () => {
+    if (notes.length === 0) { setStatus('No notes to export'); return; }
     setIsExporting(true);
-    setStatusMsg('WAV出力中... Экспорт WAV...');
+    setStatus('Rendering WAV…');
     try {
-      const ctx = new OfflineAudioContext(1, 44100 * 30, 44100);
-      const buffer = await synthesizeNotes(ctx as unknown as AudioContext, notes);
-      const wavData = audioBufferToWav(buffer);
-      const blob = new Blob([wavData], { type: 'audio/wav' });
-      downloadBlob(blob, 'utau_synthesis.wav');
-      setStatusMsg('✓ WAV сохранён');
-    } catch (err) {
-      console.error(err);
-      setStatusMsg('エラー — Ошибка экспорта');
+      const ctx = new OfflineAudioContext(1, 44100 * 60, 44100);
+      const buf = await synthesizeNotes(ctx as unknown as AudioContext, notes, gender);
+      const wav = audioBufferToWav(buf);
+      downloadBlob(new Blob([wav], { type: 'audio/wav' }), 'utau_output.wav');
+      setStatus('WAV saved');
+    } catch (e) {
+      console.error(e);
+      setStatus('Export failed');
     }
     setIsExporting(false);
-  }, [notes]);
+  }, [notes, gender]);
 
-  const handleClear = useCallback(() => {
-    stopPlayback();
-    setNotes([]);
-    setStatusMsg('クリア — Все ноты удалены');
-  }, [stopPlayback]);
+  const clear = useCallback(() => { stop(); setNotes([]); setStatus('Cleared'); }, [stop]);
 
-  // Синхронизация OTO параметров
-  const handleOtoChange = (field: keyof typeof synthParams, val: number) => {
-    setSynthParams(prev => {
+  const selectOtoKana = (k: string) => {
+    setOtoKana(k);
+    const e = OTO_INI[k];
+    if (e) setOtoVals({ offset: e.offset, consonant: e.consonant, preutterance: e.preutterance, overlap: e.overlap });
+  };
+
+  const updateOto = (field: keyof typeof otoVals, val: number) => {
+    setOtoVals(prev => {
       const next = { ...prev, [field]: val };
-      const kana = next.selectedKana;
-      if (OTO_INI[kana]) {
-        OTO_INI[kana] = {
-          ...OTO_INI[kana],
-          offset: next.offset,
-          consonant: next.consonant,
-          preutterance: next.preutterance,
-          overlap: next.overlap,
-        };
+      if (OTO_INI[otoKana]) {
+        OTO_INI[otoKana] = { ...OTO_INI[otoKana], ...next };
       }
       return next;
     });
   };
 
-  const selectKana = (kana: string) => {
-    const oto = OTO_INI[kana];
-    if (oto) {
-      setSynthParams({
-        selectedKana: kana,
-        offset: oto.offset,
-        consonant: oto.consonant,
-        preutterance: oto.preutterance,
-        overlap: oto.overlap,
-      });
-    }
-  };
-
-  const TABS: { id: Tab; label: string; jp: string }[] = [
-    { id: 'piano',  label: 'ПИАНОРОЛЛ', jp: 'ピアノロール' },
-    { id: 'voice',  label: 'ГОЛОСА',    jp: '声帯' },
-    { id: 'params', label: 'ПАРАМЕТРЫ', jp: 'パラメータ' },
-    { id: 'export', label: 'ЭКСПОРТ',   jp: 'エクスポート' },
+  const TABS: { id: Tab; label: string; icon: string }[] = [
+    { id: 'piano',  label: 'Piano Roll', icon: 'Music2' },
+    { id: 'voice',  label: 'Voice',      icon: 'Mic' },
+    { id: 'params', label: 'Parameters', icon: 'Sliders' },
+    { id: 'export', label: 'Export',     icon: 'Download' },
   ];
 
   return (
-    <div className="flex flex-col h-screen" style={{ background: '#0D0D0D', fontFamily: 'Noto Sans JP, sans-serif' }}>
-      {/* Grain overlay */}
-      <div className="grain-overlay" />
+    <div style={{ display: 'flex', flexDirection: 'column', height: '100vh', background: 'var(--bg-base)' }}>
 
-      {/* Header */}
-      <header
-        style={{
-          background: '#0A0A0A',
-          borderBottom: '1px solid rgba(139, 115, 85, 0.25)',
-          padding: '0 16px',
-          display: 'flex',
-          alignItems: 'center',
-          gap: 16,
-          height: 44,
-          flexShrink: 0,
-        }}
-      >
-        {/* Логотип */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+      {/* ── Toolbar ── */}
+      <div style={{
+        height: 48,
+        background: 'var(--bg-panel)',
+        borderBottom: '1px solid var(--border-dim)',
+        display: 'flex',
+        alignItems: 'center',
+        padding: '0 12px',
+        gap: 8,
+        flexShrink: 0,
+      }}>
+        {/* Logo */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginRight: 8 }}>
           <div style={{
-            width: 28, height: 28,
-            border: '1px solid var(--crimson)',
+            width: 28, height: 28, borderRadius: 6,
+            background: 'var(--accent-blue)',
             display: 'flex', alignItems: 'center', justifyContent: 'center',
-            position: 'relative',
           }}>
-            <span style={{ color: '#C0392B', fontSize: 13, fontFamily: 'Shippori Mincho, serif', fontWeight: 700 }}>音</span>
-            <div style={{
-              position: 'absolute', width: 4, height: 4,
-              background: '#C9A84C', borderRadius: '50%',
-              top: -2, right: -2,
-            }} />
+            <Icon name="Music2" size={15} style={{ color: '#fff' }} />
           </div>
           <div>
-            <div style={{ fontFamily: 'Shippori Mincho, serif', fontSize: 13, color: '#C9A84C', letterSpacing: '0.15em', lineHeight: 1.1 }}>
-              音声合成
-            </div>
-            <div style={{ fontSize: 8, color: '#8B7355', letterSpacing: '0.2em' }}>
-              UTAU SYNTHESIZER
-            </div>
+            <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--text-1)', lineHeight: 1.1 }}>UTAU Synth</div>
+            <div style={{ fontSize: 10, color: 'var(--text-3)' }}>Web Synthesizer</div>
           </div>
         </div>
 
-        {/* Декоративная полоса */}
-        <div style={{ flex: 1, height: 1, background: 'linear-gradient(to right, rgba(139,26,26,0.3), transparent)' }} />
+        <div style={{ width: 1, height: 24, background: 'var(--border-mid)', margin: '0 4px' }} />
 
-        {/* Транспорт */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-          <button onClick={handlePlay} className={`transport-btn ${isPlaying ? 'active' : ''}`}>
-            {isPlaying
-              ? <><Icon name="Square" size={10} style={{ display: 'inline', marginRight: 4 }} />СТОП</>
-              : <><Icon name="Play" size={10} style={{ display: 'inline', marginRight: 4 }} />再生</>
-            }
-          </button>
-          <button onClick={stopPlayback} className="transport-btn" disabled={!isPlaying}>
-            <Icon name="SkipBack" size={10} style={{ display: 'inline', marginRight: 4 }} />
-            СБРОС
-          </button>
-          <button onClick={handleClear} className="transport-btn">
-            <Icon name="Trash2" size={10} style={{ display: 'inline', marginRight: 4 }} />
-            CLEAR
-          </button>
-        </div>
+        {/* Transport */}
+        <button onClick={play} className={`btn ${isPlaying ? 'btn-primary' : 'btn-ghost'}`}>
+          <Icon name={isPlaying ? 'Square' : 'Play'} size={13} />
+          {isPlaying ? 'Stop' : 'Play'}
+        </button>
+        <button onClick={stop} className="btn btn-ghost btn-icon" disabled={!isPlaying} title="Reset">
+          <Icon name="SkipBack" size={13} />
+        </button>
+        <button onClick={clear} className="btn btn-danger btn-sm">
+          <Icon name="Trash2" size={12} />
+          Clear
+        </button>
+
+        <div style={{ width: 1, height: 24, background: 'var(--border-mid)', margin: '0 4px' }} />
 
         {/* BPM */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, paddingLeft: 8, borderLeft: '1px solid rgba(139, 115, 85, 0.2)' }}>
-          <span style={{ fontSize: 10, color: '#8B7355', letterSpacing: '0.1em', fontFamily: 'Shippori Mincho, serif' }}>BPM</span>
-          <span style={{ color: '#C9A84C', fontFamily: 'Shippori Mincho, serif', fontSize: 16, minWidth: 36, textAlign: 'center' }}>
-            {bpm}
-          </span>
-          <input
-            type="range" min={60} max={180} value={bpm}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <span style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600 }}>BPM</span>
+          <span style={{ fontSize: 15, fontWeight: 700, color: 'var(--text-1)', minWidth: 30 }}>{bpm}</span>
+          <input type="range" min={60} max={180} value={bpm}
             onChange={e => setBpm(Number(e.target.value))}
-            className="utau-slider"
-            style={{ width: 80, '--val': `${((bpm - 60) / 120) * 100}%` } as React.CSSProperties}
+            className="synth-slider"
+            style={{ width: 90, '--pct': `${((bpm - 60) / 120) * 100}%` } as React.CSSProperties}
           />
         </div>
 
-        {/* Счётчик нот */}
-        <div style={{ fontSize: 10, color: '#8B7355', letterSpacing: '0.1em', paddingLeft: 8, borderLeft: '1px solid rgba(139, 115, 85, 0.2)' }}>
-          <span style={{ color: '#C9A84C', fontFamily: 'Shippori Mincho, serif', fontSize: 14 }}>{notes.length}</span>
-          {' '}音符
-        </div>
-      </header>
+        <div style={{ width: 1, height: 24, background: 'var(--border-mid)', margin: '0 4px' }} />
 
-      {/* Tabs */}
-      <div style={{ background: '#0A0A0A', borderBottom: '1px solid rgba(139, 115, 85, 0.15)', display: 'flex', flexShrink: 0 }}>
-        {TABS.map(tab => (
-          <button
-            key={tab.id}
-            className={`utau-tab ${activeTab === tab.id ? 'active' : ''}`}
-            onClick={() => setActiveTab(tab.id)}
-          >
-            <span style={{ fontSize: 9, display: 'block', opacity: 0.6 }}>{tab.jp}</span>
-            {tab.label}
-          </button>
-        ))}
-        <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'flex-end', padding: '0 12px' }}>
-          <span style={{ fontSize: 10, color: '#5a5040', fontFamily: 'Shippori Mincho, serif', letterSpacing: '0.05em' }}>
-            {statusMsg}
-          </span>
+        {/* Voice gender quick toggle */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          <span style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600 }}>Voice</span>
+          <div style={{ display: 'flex', gap: 2 }}>
+            {(['male', 'female'] as VoiceGender[]).map(g => (
+              <button key={g} onClick={() => setGender(g)}
+                className={`btn btn-sm ${gender === g ? 'btn-primary' : 'btn-ghost'}`}
+                style={{ padding: '3px 10px', fontSize: 11 }}>
+                {g === 'male' ? '♂ Male' : '♀ Female'}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* Spacer */}
+        <div style={{ flex: 1 }} />
+
+        {/* Notes count + status */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+            <div className="status-dot" style={{ background: isPlaying ? '#f59e0b' : 'var(--accent-green)', boxShadow: isPlaying ? '0 0 6px rgba(245,158,11,0.6)' : undefined }} />
+            <span style={{ fontSize: 12, color: 'var(--text-2)' }}>{status}</span>
+          </div>
+          <div style={{
+            padding: '3px 8px',
+            background: 'var(--bg-card)',
+            border: '1px solid var(--border-dim)',
+            borderRadius: 4,
+            fontSize: 12,
+            color: 'var(--text-2)',
+          }}>
+            <span style={{ color: 'var(--accent-blue)', fontWeight: 700 }}>{notes.length}</span> notes
+          </div>
         </div>
       </div>
 
-      {/* Content */}
-      <div className="flex-1 overflow-hidden">
+      {/* ── Tabs ── */}
+      <div className="tab-bar">
+        {TABS.map(t => (
+          <button key={t.id} className={`tab-item ${tab === t.id ? 'active' : ''}`} onClick={() => setTab(t.id)}>
+            {t.label}
+          </button>
+        ))}
+        <div style={{ flex: 1 }} />
+        {/* Playhead time */}
+        <div style={{ display: 'flex', alignItems: 'center', padding: '0 12px', gap: 4, fontSize: 11, color: 'var(--text-3)' }}>
+          <Icon name="Clock" size={11} />
+          {playheadSec.toFixed(2)}s
+        </div>
+      </div>
 
-        {/* Piano Roll Tab */}
-        {activeTab === 'piano' && (
-          <div className="h-full flex flex-col">
-            <div style={{ padding: '6px 12px', borderBottom: '1px solid rgba(139, 115, 85, 0.1)', display: 'flex', gap: 12, alignItems: 'center', flexShrink: 0, background: '#0A0A0A' }}>
-              <span style={{ fontSize: 10, color: '#8B7355' }}>
-                ← Прокрутите для навигации по пианороллу
-              </span>
-              <span style={{ fontSize: 10, color: '#5a5040' }}>
-                Клик по сетке — новая нота &nbsp;|&nbsp; Клик по ноте — удалить &nbsp;|&nbsp; Тянуть правый край — изменить длину
-              </span>
+      {/* ── Content ── */}
+      <div style={{ flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
+
+        {/* Piano Roll */}
+        {tab === 'piano' && (
+          <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+            <div style={{
+              padding: '5px 12px',
+              fontSize: 11,
+              color: 'var(--text-3)',
+              background: 'var(--bg-panel)',
+              borderBottom: '1px solid var(--border-dim)',
+              display: 'flex',
+              gap: 16,
+              flexShrink: 0,
+            }}>
+              <span><span style={{ color: 'var(--text-2)' }}>Click empty cell</span> — create note</span>
+              <span><span style={{ color: 'var(--text-2)' }}>Click note</span> — delete</span>
+              <span><span style={{ color: 'var(--text-2)' }}>Double-click note</span> — edit lyric & duration</span>
+              <span><span style={{ color: 'var(--text-2)' }}>Drag right edge</span> — resize</span>
             </div>
-            <div className="flex-1 overflow-auto">
-              <PianoRoll
-                notes={notes}
-                onNotesChange={setNotes}
-                playheadSec={playheadSec}
-                isPlaying={isPlaying}
-                bpm={bpm}
-              />
-            </div>
+            <PianoRoll
+              notes={notes}
+              onNotesChange={setNotes}
+              playheadSec={playheadSec}
+              isPlaying={isPlaying}
+              bpm={bpm}
+            />
           </div>
         )}
 
         {/* Voice Tab */}
-        {activeTab === 'voice' && (
-          <div className="h-full overflow-auto p-6" style={{ background: '#0D0D0D' }}>
-            <div className="max-w-2xl mx-auto">
-              <div className="panel-header mb-1">声帯バンク</div>
-              <h2 style={{ fontFamily: 'Shippori Mincho, serif', color: '#F5EDD6', fontSize: 22, marginBottom: 4 }}>
-                Голосовой банк
+        {tab === 'voice' && (
+          <div style={{ flex: 1, overflow: 'auto', padding: 24 }}>
+            <div style={{ maxWidth: 600, margin: '0 auto' }}>
+              <div className="section-label">Voicebank Selection</div>
+              <h2 style={{ fontSize: 20, fontWeight: 700, color: 'var(--text-1)', marginBottom: 6, marginTop: 4 }}>
+                Voice Settings
               </h2>
-              <p style={{ color: '#8B7355', fontSize: 12, marginBottom: 24 }}>
-                Мужской японский голос с формантным синтезом через Web Audio API
+              <p style={{ fontSize: 13, color: 'var(--text-3)', marginBottom: 24 }}>
+                Choose between male and female formant profiles. Changes apply on next synthesis.
               </p>
 
-              {/* Voice card */}
-              <div className="kamon-border" style={{ padding: 20, marginBottom: 24 }}>
-                <div style={{ display: 'flex', gap: 16, alignItems: 'center', marginBottom: 16 }}>
-                  <div style={{
-                    width: 52, height: 52,
-                    border: '1px solid var(--crimson)',
-                    display: 'flex', alignItems: 'center', justifyContent: 'center',
-                    fontSize: 24,
-                    background: 'rgba(139, 26, 26, 0.1)',
-                  }}>男</div>
-                  <div>
-                    <div style={{ fontFamily: 'Shippori Mincho, serif', color: '#C9A84C', fontSize: 16, letterSpacing: '0.1em' }}>
-                      男性 OTOKO
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginBottom: 28 }}>
+                {([
+                  { g: 'male' as VoiceGender, icon: '♂', name: 'OTOKO — Male', desc: 'Bass-baritone range · F1/F2 300–1100 Hz · Deep character' },
+                  { g: 'female' as VoiceGender, icon: '♀', name: 'ONNA — Female', desc: 'Soprano range · F1/F2 380–1300 Hz · Bright, airy timbre' },
+                ]).map(({ g, icon, name, desc }) => (
+                  <div key={g} className={`voice-card ${gender === g ? 'selected' : ''}`} onClick={() => setGender(g)}>
+                    <div style={{
+                      width: 44, height: 44, borderRadius: 8,
+                      background: gender === g ? 'var(--accent-blue)' : 'var(--bg-panel)',
+                      display: 'flex', alignItems: 'center', justifyContent: 'center',
+                      fontSize: 22, flexShrink: 0,
+                      border: '1px solid var(--border-mid)',
+                    }}>{icon}</div>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ fontSize: 14, fontWeight: 600, color: 'var(--text-1)', marginBottom: 2 }}>{name}</div>
+                      <div style={{ fontSize: 12, color: 'var(--text-3)' }}>{desc}</div>
                     </div>
-                    <div style={{ color: '#8B7355', fontSize: 11, letterSpacing: '0.05em', marginTop: 2 }}>
-                      Мужской · Японский · Формантный синтез
-                    </div>
-                    <div style={{ color: '#C0392B', fontSize: 10, marginTop: 4 }}>● АКТИВЕН</div>
+                    {gender === g && <div className="status-dot" />}
                   </div>
-                </div>
-
-                <div style={{ color: '#8B7355', fontSize: 11, marginBottom: 12 }}>Поддерживаемые слоги:</div>
-                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
-                  {HIRAGANA_GRID.flat().map(k => (
-                    <span key={k} style={{
-                      background: '#1a1a1a',
-                      border: '1px solid rgba(139, 115, 85, 0.3)',
-                      color: '#C9A84C',
-                      padding: '3px 8px',
-                      fontSize: 14,
-                      fontFamily: 'Noto Serif JP, serif',
-                    }}>{k}</span>
-                  ))}
-                  <span style={{ color: '#5a5040', fontSize: 11, padding: '3px 4px' }}>ん</span>
-                </div>
+                ))}
               </div>
 
-              {/* Formant info */}
-              <div style={{ borderTop: '1px solid rgba(139, 115, 85, 0.15)', paddingTop: 16 }}>
-                <div className="panel-header mb-3">フォルマント — Форманты гласных</div>
-                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 8 }}>
-                  {(['a','i','u','e','o'] as const).map((v, idx) => {
-                    const freqs = [[700,1100,2640],[280,2250,2950],[310,870,2350],[490,1870,2650],[450,800,2620]][idx];
-                    const kana = ['あ','い','う','え','お'][idx];
-                    return (
-                      <div key={v} style={{ background: '#111', border: '1px solid rgba(139, 115, 85, 0.2)', padding: '10px 8px', textAlign: 'center' }}>
-                        <div style={{ fontFamily: 'Noto Serif JP, serif', fontSize: 20, color: '#C9A84C', marginBottom: 4 }}>{kana}</div>
-                        <div style={{ fontSize: 10, color: '#8B7355' }}>F1: {freqs[0]}Hz</div>
-                        <div style={{ fontSize: 10, color: '#8B7355' }}>F2: {freqs[1]}Hz</div>
-                        <div style={{ fontSize: 10, color: '#5a5040' }}>F3: {freqs[2]}Hz</div>
-                      </div>
-                    );
-                  })}
-                </div>
+              {/* Formant table */}
+              <div className="section-label">Formant Profile — {gender === 'male' ? 'Male' : 'Female'}</div>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5,1fr)', gap: 8, marginBottom: 16 }}>
+                {(['a','i','u','e','o'] as const).map((v, idx) => {
+                  const mf = [[700,1100,2640],[280,2250,2950],[310,870,2350],[490,1870,2650],[450,800,2620]];
+                  const ff = [[900,1300,3000],[380,2700,3300],[430,1200,2800],[620,2200,3000],[560,1000,2900]];
+                  const f = gender === 'male' ? mf[idx] : ff[idx];
+                  const kana = ['あ','い','う','え','お'][idx];
+                  return (
+                    <div key={v} style={{ background: 'var(--bg-card)', border: '1px solid var(--border-dim)', borderRadius: 6, padding: '10px 8px', textAlign: 'center' }}>
+                      <div style={{ fontSize: 20, fontFamily: 'Noto Sans JP, sans-serif', color: 'var(--accent-blue)', marginBottom: 4 }}>{kana}</div>
+                      <div style={{ fontSize: 10, color: 'var(--text-3)' }}>F1 {f[0]}Hz</div>
+                      <div style={{ fontSize: 10, color: 'var(--text-3)' }}>F2 {f[1]}Hz</div>
+                      <div style={{ fontSize: 10, color: 'var(--text-3)' }}>F3 {f[2]}Hz</div>
+                    </div>
+                  );
+                })}
+              </div>
+
+              {/* Hiragana coverage */}
+              <div className="section-label" style={{ marginTop: 20 }}>Supported Syllables ({HIRAGANA_ROWS.flatMap(r => r.kana).length} total)</div>
+              <div style={{ background: 'var(--bg-card)', border: '1px solid var(--border-dim)', borderRadius: 8, padding: 14 }}>
+                {HIRAGANA_ROWS.map(row => (
+                  <div key={row.label} style={{ marginBottom: 8 }}>
+                    <div style={{ fontSize: 10, color: 'var(--text-3)', marginBottom: 4 }}>{row.label}</div>
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+                      {row.kana.map(k => (
+                        <span key={k} style={{
+                          padding: '3px 6px',
+                          background: 'var(--bg-panel)',
+                          border: '1px solid var(--border-dim)',
+                          borderRadius: 3,
+                          fontSize: 14,
+                          color: 'var(--text-2)',
+                          fontFamily: 'Noto Sans JP, sans-serif',
+                        }}>{k}</span>
+                      ))}
+                    </div>
+                  </div>
+                ))}
               </div>
             </div>
           </div>
         )}
 
-        {/* Params Tab */}
-        {activeTab === 'params' && (
-          <div className="h-full overflow-auto p-6" style={{ background: '#0D0D0D' }}>
-            <div className="max-w-2xl mx-auto">
-              <div className="panel-header mb-1">OTO設定</div>
-              <h2 style={{ fontFamily: 'Shippori Mincho, serif', color: '#F5EDD6', fontSize: 22, marginBottom: 4 }}>
-                Параметры синтеза OTO.ini
+        {/* Parameters Tab */}
+        {tab === 'params' && (
+          <div style={{ flex: 1, overflow: 'auto', padding: 24 }}>
+            <div style={{ maxWidth: 600, margin: '0 auto' }}>
+              <div className="section-label">OTO.ini Configuration</div>
+              <h2 style={{ fontSize: 20, fontWeight: 700, color: 'var(--text-1)', marginBottom: 6, marginTop: 4 }}>
+                Synthesis Parameters
               </h2>
-              <p style={{ color: '#8B7355', fontSize: 12, marginBottom: 20 }}>
-                Настройте тайминг и форму каждого слога. Изменения применяются немедленно.
+              <p style={{ fontSize: 13, color: 'var(--text-3)', marginBottom: 20 }}>
+                Adjust timing parameters per syllable. Changes apply immediately to next playback.
               </p>
 
-              {/* Выбор слога */}
-              <div className="panel-header mb-2">音節選択 — Выбор слога</div>
-              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginBottom: 20 }}>
-                {HIRAGANA_GRID.flat().map(k => (
-                  <button
-                    key={k}
-                    onClick={() => selectKana(k)}
-                    style={{
-                      background: synthParams.selectedKana === k ? 'var(--crimson)' : '#111',
-                      border: `1px solid ${synthParams.selectedKana === k ? '#C0392B' : 'rgba(139, 115, 85, 0.25)'}`,
-                      color: synthParams.selectedKana === k ? '#F5EDD6' : '#C9A84C',
-                      padding: '6px 10px',
-                      fontSize: 16,
-                      cursor: 'pointer',
-                      fontFamily: 'Noto Serif JP, serif',
-                      transition: 'all 0.15s',
-                    }}
-                  >{k}</button>
-                ))}
-              </div>
-
-              {/* Параметры OTO */}
-              <div className="kamon-border" style={{ padding: 20 }}>
-                <div style={{ fontFamily: 'Shippori Mincho, serif', color: '#C9A84C', fontSize: 18, marginBottom: 16 }}>
-                  {synthParams.selectedKana} — OTO Parameters
-                </div>
-                {([
-                  { key: 'offset',       label: 'Offset',        jp: 'オフセット',      desc: 'Смещение начала звука (мс)', min: 0, max: 200 },
-                  { key: 'consonant',    label: 'Consonant',     jp: '子音',           desc: 'Длительность согласной (мс)', min: 0, max: 300 },
-                  { key: 'preutterance',label: 'Preutterance',  jp: '先行発声',       desc: 'Точка начала озвучивания (мс)', min: 0, max: 200 },
-                  { key: 'overlap',      label: 'Overlap',       jp: 'オーバーラップ', desc: 'Кроссфейд с предыдущей нотой (мс)', min: 0, max: 150 },
-                ] as const).map(param => (
-                  <div key={param.key} style={{ marginBottom: 16 }}>
-                    <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 6 }}>
-                      <div>
-                        <span style={{ color: '#C9A84C', fontFamily: 'Shippori Mincho, serif', fontSize: 13 }}>{param.label}</span>
-                        <span style={{ color: '#5a5040', fontSize: 11, marginLeft: 8 }}>{param.jp}</span>
-                      </div>
-                      <span style={{ color: '#C0392B', fontFamily: 'Shippori Mincho, serif', fontSize: 14, minWidth: 42, textAlign: 'right' }}>
-                        {synthParams[param.key]}ms
-                      </span>
+              {/* Syllable picker */}
+              <div className="section-label">Select Syllable</div>
+              <div style={{ background: 'var(--bg-card)', border: '1px solid var(--border-dim)', borderRadius: 8, padding: 12, marginBottom: 20, maxHeight: 220, overflowY: 'auto' }}>
+                {HIRAGANA_ROWS.map(row => (
+                  <div key={row.label} style={{ marginBottom: 8 }}>
+                    <div style={{ fontSize: 10, color: 'var(--text-3)', marginBottom: 4 }}>{row.label}</div>
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+                      {row.kana.map(k => (
+                        <button key={k} onClick={() => selectOtoKana(k)}
+                          className={`kana-btn ${otoKana === k ? 'selected' : ''}`}>{k}</button>
+                      ))}
                     </div>
-                    <input
-                      type="range"
-                      min={param.min} max={param.max}
-                      value={synthParams[param.key]}
-                      onChange={e => handleOtoChange(param.key, Number(e.target.value))}
-                      className="utau-slider"
-                      style={{ width: '100%', '--val': `${((synthParams[param.key] - param.min) / (param.max - param.min)) * 100}%` } as React.CSSProperties}
-                    />
-                    <div style={{ color: '#5a5040', fontSize: 10, marginTop: 3 }}>{param.desc}</div>
                   </div>
                 ))}
               </div>
 
-              {/* OTO.ini visualizer */}
-              <div style={{ marginTop: 16, padding: 12, background: '#0A0A0A', border: '1px solid rgba(139,115,85,0.1)', fontFamily: 'monospace' }}>
-                <div style={{ color: '#5a5040', fontSize: 10, marginBottom: 6 }}># OTO.ini preview</div>
-                <div style={{ color: '#8B7355', fontSize: 11 }}>
-                  {synthParams.selectedKana}.wav={synthParams.selectedKana},{synthParams.offset},{synthParams.consonant},{synthParams.preutterance},{synthParams.overlap},0
+              {/* OTO params */}
+              <div style={{ background: 'var(--bg-card)', border: '1px solid var(--border-dim)', borderRadius: 8, padding: 16 }}>
+                <div style={{ fontSize: 15, fontWeight: 600, color: 'var(--text-1)', marginBottom: 16, display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <span style={{ fontFamily: 'Noto Sans JP, sans-serif', fontSize: 22, color: 'var(--accent-blue)' }}>{otoKana}</span>
+                  OTO Parameters
+                </div>
+                {([
+                  { key: 'offset',        label: 'Offset',        desc: 'Start offset (silence skip)',         min: 0, max: 200 },
+                  { key: 'consonant',     label: 'Consonant',     desc: 'Consonant section duration',          min: 0, max: 300 },
+                  { key: 'preutterance', label: 'Preutterance',  desc: 'Pre-utterance lead-in point',         min: 0, max: 200 },
+                  { key: 'overlap',       label: 'Overlap',       desc: 'Crossfade overlap with previous',     min: 0, max: 150 },
+                ] as const).map(p => (
+                  <div key={p.key} className="param-row">
+                    <div>
+                      <div style={{ fontSize: 13, fontWeight: 500, color: 'var(--text-1)' }}>{p.label}</div>
+                      <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 1 }}>{p.desc}</div>
+                    </div>
+                    <input
+                      type="range" min={p.min} max={p.max} value={otoVals[p.key]}
+                      onChange={e => updateOto(p.key, Number(e.target.value))}
+                      className="synth-slider"
+                      style={{ '--pct': `${((otoVals[p.key] - p.min) / (p.max - p.min)) * 100}%` } as React.CSSProperties}
+                    />
+                    <div style={{ textAlign: 'right', fontSize: 13, fontWeight: 600, color: 'var(--accent-blue)', minWidth: 48 }}>
+                      {otoVals[p.key]}ms
+                    </div>
+                  </div>
+                ))}
+
+                <div style={{ marginTop: 14, padding: 10, background: 'var(--bg-base)', borderRadius: 6, fontFamily: 'monospace', fontSize: 11, color: 'var(--text-3)' }}>
+                  # OTO.ini preview<br />
+                  <span style={{ color: 'var(--text-2)' }}>
+                    {otoKana}.wav={otoKana},{otoVals.offset},{otoVals.consonant},{otoVals.preutterance},{otoVals.overlap},0
+                  </span>
                 </div>
               </div>
             </div>
@@ -456,59 +411,57 @@ const Index: React.FC = () => {
         )}
 
         {/* Export Tab */}
-        {activeTab === 'export' && (
-          <div className="h-full overflow-auto p-6" style={{ background: '#0D0D0D' }}>
-            <div className="max-w-xl mx-auto">
-              <div className="panel-header mb-1">エクスポート</div>
-              <h2 style={{ fontFamily: 'Shippori Mincho, serif', color: '#F5EDD6', fontSize: 22, marginBottom: 4 }}>
-                Экспорт аудио
+        {tab === 'export' && (
+          <div style={{ flex: 1, overflow: 'auto', padding: 24 }}>
+            <div style={{ maxWidth: 480, margin: '0 auto' }}>
+              <div className="section-label">Audio Export</div>
+              <h2 style={{ fontSize: 20, fontWeight: 700, color: 'var(--text-1)', marginBottom: 6, marginTop: 4 }}>
+                Export
               </h2>
-              <p style={{ color: '#8B7355', fontSize: 12, marginBottom: 28 }}>
-                Синтезирует все ноты в аудиофайл. Нот на пианоролле: <strong style={{ color: '#C9A84C' }}>{notes.length}</strong>
+              <p style={{ fontSize: 13, color: 'var(--text-3)', marginBottom: 24 }}>
+                Render all notes to audio. Currently on piano roll: <strong style={{ color: 'var(--accent-blue)' }}>{notes.length} notes</strong>
               </p>
 
               {notes.length === 0 && (
-                <div style={{ border: '1px solid rgba(139,26,26,0.3)', padding: 16, marginBottom: 20, color: '#8B7355', fontSize: 12 }}>
-                  ⚠ Добавьте ноты на пианоролл перед экспортом
+                <div style={{ padding: 14, background: 'rgba(239,68,68,0.08)', border: '1px solid rgba(239,68,68,0.2)', borderRadius: 8, marginBottom: 20, fontSize: 13, color: '#fca5a5' }}>
+                  No notes on the piano roll. Add notes before exporting.
                 </div>
               )}
 
-              {/* WAV Export */}
-              <div className="kamon-border" style={{ padding: 20, marginBottom: 16 }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 12 }}>
-                  <div style={{ width: 40, height: 40, border: '1px solid var(--gold-dim)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                    <Icon name="FileAudio" size={18} style={{ color: '#C9A84C' }} />
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginBottom: 24 }}>
+                <div style={{ background: 'var(--bg-card)', border: '1px solid var(--border-dim)', borderRadius: 8, padding: 16 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 14 }}>
+                    <div style={{ width: 40, height: 40, borderRadius: 8, background: 'rgba(59,130,246,0.1)', border: '1px solid var(--border-mid)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                      <Icon name="FileAudio" size={18} style={{ color: 'var(--accent-blue)' }} />
+                    </div>
+                    <div>
+                      <div style={{ fontSize: 14, fontWeight: 600, color: 'var(--text-1)' }}>WAV — PCM 16-bit</div>
+                      <div style={{ fontSize: 12, color: 'var(--text-3)' }}>Lossless · 44 100 Hz · Mono</div>
+                    </div>
                   </div>
-                  <div>
-                    <div style={{ color: '#C9A84C', fontFamily: 'Shippori Mincho, serif', fontSize: 15 }}>WAV — PCM 16-bit</div>
-                    <div style={{ color: '#5a5040', fontSize: 11 }}>Несжатый · 44100 Hz · Моно</div>
-                  </div>
+                  <button onClick={exportWav} disabled={isExporting || notes.length === 0}
+                    className="btn btn-primary" style={{ width: '100%', justifyContent: 'center', padding: '10px 16px' }}>
+                    <Icon name={isExporting ? 'Loader' : 'Download'} size={14} />
+                    {isExporting ? 'Rendering…' : 'Save as WAV'}
+                  </button>
                 </div>
-                <button
-                  onClick={handleExportWav}
-                  disabled={isExporting || notes.length === 0}
-                  className="transport-btn active"
-                  style={{ width: '100%', padding: '10px 16px', fontSize: 12 }}
-                >
-                  {isExporting ? '処理中... Синтез...' : 'WAVとして保存 — Сохранить WAV'}
-                </button>
               </div>
 
-              {/* Info */}
-              <div style={{ borderTop: '1px solid rgba(139, 115, 85, 0.15)', paddingTop: 16, color: '#5a5040', fontSize: 11 }}>
-                <div className="panel-header mb-2">合成情報 — Информация</div>
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+              {/* Synthesis info */}
+              <div className="section-label">Synthesis Info</div>
+              <div style={{ background: 'var(--bg-card)', border: '1px solid var(--border-dim)', borderRadius: 8, padding: 14 }}>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 0 }}>
                   {[
-                    ['Метод синтеза', 'Формантный + конкатенативный'],
-                    ['Частота дискретизации', '44 100 Hz'],
-                    ['Каналы', 'Моно'],
-                    ['Кроссфейд', 'Overlap из OTO.ini'],
-                    ['Гласные', 'ADSR + форманты F1/F2/F3'],
-                    ['Голосовой банк', 'Мужской (OTOKO)'],
+                    ['Engine',        'Formant + concatenative'],
+                    ['Sample rate',   '44 100 Hz'],
+                    ['Channels',      'Mono'],
+                    ['Crossfade',     'OTO.ini overlap'],
+                    ['Harmonics',     'Male 14 · Female 10'],
+                    ['Voicebank',     gender === 'male' ? 'OTOKO (Male)' : 'ONNA (Female)'],
                   ].map(([k, v]) => (
-                    <div key={k} style={{ padding: '6px 0', borderBottom: '1px solid rgba(139,115,85,0.08)' }}>
-                      <div style={{ color: '#8B7355', marginBottom: 2 }}>{k}</div>
-                      <div style={{ color: '#C9A84C', fontSize: 11 }}>{v}</div>
+                    <div key={k} style={{ padding: '8px 0', borderBottom: '1px solid var(--border-dim)' }}>
+                      <div style={{ fontSize: 11, color: 'var(--text-3)', marginBottom: 2 }}>{k}</div>
+                      <div style={{ fontSize: 12, color: 'var(--text-2)', fontWeight: 500 }}>{v}</div>
                     </div>
                   ))}
                 </div>
@@ -518,26 +471,24 @@ const Index: React.FC = () => {
         )}
       </div>
 
-      {/* Footer */}
-      <footer style={{
-        height: 24,
-        background: '#060606',
-        borderTop: '1px solid rgba(139, 115, 85, 0.12)',
+      {/* ── Footer ── */}
+      <div style={{
+        height: 22,
+        background: 'var(--bg-panel)',
+        borderTop: '1px solid var(--border-dim)',
         display: 'flex',
         alignItems: 'center',
         padding: '0 12px',
         gap: 16,
         flexShrink: 0,
       }}>
-        <span style={{ fontSize: 9, color: '#3a3028', fontFamily: 'Shippori Mincho, serif', letterSpacing: '0.2em' }}>
-          音声合成システム v1.0 · Web Audio API · UTAU-compatible
-        </span>
+        <span style={{ fontSize: 10, color: 'var(--text-3)' }}>UTAU Web Synthesizer v1.1</span>
+        <span style={{ fontSize: 10, color: 'var(--text-3)' }}>Web Audio API · Formant synthesis</span>
         <div style={{ flex: 1 }} />
-        {/* Декоративные иероглифы */}
-        <span style={{ fontSize: 9, color: '#2a2018', letterSpacing: '0.3em' }}>
-          音・響・声・韻
+        <span style={{ fontSize: 10, color: 'var(--text-3)' }}>
+          {gender === 'male' ? '♂ Male' : '♀ Female'} · {bpm} BPM
         </span>
-      </footer>
+      </div>
     </div>
   );
 };
